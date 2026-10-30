@@ -2423,13 +2423,31 @@ private:
     void listenLoop() {
         int mask = 0;
         bool encMuted = false;
+        const double now = playNow();
         auto slotTraffic = [&](int ts) { return osmotetradecoder.getTimeslotContent(ts - 1) == 4; };
         auto owner = [&](int ts) { return subscribers.slotOwner(ts); };
-        auto encOf = [&](const TetraSubscriberTable::SlotOwner& o) { return o.ssi && (o.e2ee || o.air); };
+        auto encOf = [&](const TetraSubscriberTable::SlotOwner& o, int ts) {
+            if (o.ssi) { return o.e2ee || o.air; }
+            // No identified owner for this timeslot. The channel allocation of an
+            // air-encrypted call is itself encrypted and unreadable (see the addr_cb
+            // call in tetra_upper_mac.c), so its timeslot can never be identified via
+            // slotOwner() — without this fallback "Mute encrypted" silently does
+            // nothing for exactly the calls it should mute. If encrypted signalling
+            // was seen recently, treat this unidentified traffic as that call.
+            // The latch keeps the slot muted for the rest of the call even after the
+            // signalling ages out. Trade-off: a clear call whose setup was missed
+            // (weak signal) is also muted while encrypted traffic is around.
+            if (now - encMuteLatch[ts] < ENC_MUTE_LATCH_S) { return true; }
+            if (now - (double)subscribers.lastEncrypted() < ENC_RECENT_S) {
+                encMuteLatch[ts] = now;
+                return true;
+            }
+            return false;
+        };
         auto allowed = [&](int ts) {
-            if (!listenMuteEnc) { return true; }
+            if (!listenMuteEnc) { encMuteLatch[ts] = 0.0; return true; }
             auto o = owner(ts);
-            if (encOf(o)) { encMuted = true; return false; }
+            if (encOf(o, ts)) { encMuted = true; return false; }
             return true;
         };
         if (listenMode == 1) {
@@ -2726,7 +2744,10 @@ private:
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Encrypted speech cannot be decoded (no decryption in this program); played\n"
                               "anyway it is only noise. Applies when the call is marked encrypted\n"
-                              "(air interface encryption or end-to-end flag of the call setup).");
+                              "(air interface encryption or end-to-end flag of the call setup).\n"
+                              "The channel allocation of an encrypted call is unreadable, so its\n"
+                              "timeslot cannot be identified: while encrypted signalling is around,\n"
+                              "traffic on unidentified timeslots is muted as well.");
         }
         drawPlaying();
     }
@@ -4993,6 +5014,14 @@ private:
     int playMode = 2;
     float playModeAtW = -1.0f, playMaxH = 0.0f, playMaxHAtW = -1.0f;
     bool listenMutedEnc = false;
+    // "Mute encrypted" fallback: the channel allocation of an air-encrypted
+    // call is itself encrypted and unreadable, so such calls never get an
+    // allocTs and slotOwner() cannot place them on a timeslot (see the
+    // addr_cb call in tetra_upper_mac.c). encMuteLatch[ts] holds the last
+    // time ts was muted as (probably) encrypted.
+    static constexpr double ENC_RECENT_S = 120.0;    // encrypted signalling seen within this -> suspect slot
+    static constexpr double ENC_MUTE_LATCH_S = 30.0; // keep a suspect slot muted this long after the last trigger
+    double encMuteLatch[5] = { 0, 0, 0, 0, 0 };
     uint32_t listenAddSsi = 0;
     bool listenAddGroup = true;
     TetraPropagationView propView;
